@@ -33,29 +33,25 @@ biSere is designed around three core principles:
 
 The biSere format consists of four sections:
 
-```
-┌─────────────────────────────────────────┐
-│         Format Header (80 bytes)        │
-│  - Magic: 0x42495345 ("BISE")          │
-│  - Version: 1                            │
-│  - Header size, offset table size        │
-│  - Data section size, var section size   │
-│  - Checksum (optional, currently 0)      │
-│  - Reserved space (48 bytes)              │
-├─────────────────────────────────────────┤
-│      Offset Table (variable size)        │
-│  - Array of OffsetEntry structures       │
-│  - Each entry: field_id, offset, type    │
-├─────────────────────────────────────────┤
-│      Fixed Data Section                  │
-│  - Fixed-size fields (POD types)          │
-│  - Contiguous layout                      │
-├─────────────────────────────────────────┤
-│      Variable Data Section               │
-│  - Strings (null-terminated)              │
-│  - Blobs (binary data)                    │
-└─────────────────────────────────────────┘
-```
+1. **Format Header (80 bytes)**
+   - Magic: 0x42495345 ("BISE")
+   - Version: 1
+   - Header size, offset table size
+   - Data section size, var section size
+   - Checksum (optional, currently 0)
+   - Reserved space (48 bytes)
+
+2. **Offset Table (variable size)**
+   - Array of OffsetEntry structures
+   - Each entry: field_id, offset, type
+
+3. **Fixed Data Section**
+   - Fixed-size fields (POD types)
+   - Contiguous layout
+
+4. **Variable Data Section**
+   - Strings (null-terminated)
+   - Blobs (binary data)
 
 ### Format Header Structure
 
