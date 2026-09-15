@@ -75,14 +75,18 @@ fn test_roundtrip() {
     let buffer = create_test_buffer();
     let view = BinaryView::view(&buffer).unwrap();
     
-    let id: &u64 = view.get_field(1).unwrap();
-    let age: &u32 = view.get_field(2).unwrap();
-    let score: &f64 = view.get_field(3).unwrap();
+    // Whether a multi-byte field's real address is aligned depends on
+    // the allocator's placement of the Vec (Miri deliberately does not
+    // over-align it), not just its offset within the buffer — so this
+    // test uses get_field_unaligned for every field that isn't 1 byte.
+    let id: u64 = view.get_field_unaligned(1).unwrap();
+    let age: u32 = view.get_field_unaligned(2).unwrap();
+    let score: f64 = view.get_field_unaligned(3).unwrap();
     let active: &u8 = view.get_field(4).unwrap();
-    
-    assert_eq!(*id, 12345);
-    assert_eq!(*age, 30);
-    assert_eq!(*score, 95.5);
+
+    assert_eq!(id, 12345);
+    assert_eq!(age, 30);
+    assert_eq!(score, 95.5);
     assert_eq!(*active, 1);
 }
 
@@ -90,18 +94,23 @@ fn test_roundtrip() {
 fn test_zero_copy() {
     let buffer = create_test_buffer();
     let view = BinaryView::view(&buffer).unwrap();
-    
-    let id_ptr: &u64 = view.get_field(1).unwrap();
-    
+
+    // Uses the u8 field (active): align 1 is satisfied by any address,
+    // so this reliably exercises get_field's zero-copy reference without
+    // depending on where the allocator happens to place the Vec (a u64
+    // or u32 field here would only be aligned by luck; see the note in
+    // test_roundtrip).
+    let active_ptr: &u8 = view.get_field(4).unwrap();
+
     // Verify that the pointer points into the original buffer
     let buffer_ptr = buffer.as_ptr() as usize;
-    let id_ptr_addr = id_ptr as *const u64 as usize;
-    
-    assert!(id_ptr_addr >= buffer_ptr);
-    assert!(id_ptr_addr < buffer_ptr + buffer.len());
-    
+    let active_ptr_addr = active_ptr as *const u8 as usize;
+
+    assert!(active_ptr_addr >= buffer_ptr);
+    assert!(active_ptr_addr < buffer_ptr + buffer.len());
+
     // Verify the value matches
-    assert_eq!(*id_ptr, 12345);
+    assert_eq!(*active_ptr, 1);
 }
 
 #[test]
@@ -127,9 +136,12 @@ fn test_modify_fixed() {
     
     // Verify modifications
     let view = BinaryView::view(&buffer).unwrap();
-    assert_eq!(*view.get_field::<u64>(1).unwrap(), 99999);
-    assert_eq!(*view.get_field::<u32>(2).unwrap(), 35);
-    assert_eq!(*view.get_field::<f64>(3).unwrap(), 88.8);
+    // Whether a multi-byte field's real address is aligned depends on
+    // the allocator's placement of the Vec, not just its file offset;
+    // use get_field_unaligned for every field wider than 1 byte.
+    assert_eq!(view.get_field_unaligned::<u64>(1).unwrap(), 99999);
+    assert_eq!(view.get_field_unaligned::<u32>(2).unwrap(), 35);
+    assert_eq!(view.get_field_unaligned::<f64>(3).unwrap(), 88.8);
     assert_eq!(*view.get_field::<u8>(4).unwrap(), 0);
 }
 
@@ -368,14 +380,18 @@ fn test_all_integer_types() {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer).unwrap();
 
-    assert_eq!(*view.get_field::<i8>(1).unwrap(), -128);
-    assert_eq!(*view.get_field::<i16>(2).unwrap(), -32768);
-    assert_eq!(*view.get_field::<i32>(3).unwrap(), -2147483648);
-    assert_eq!(*view.get_field::<i64>(4).unwrap(), -9223372036854775808);
-    assert_eq!(*view.get_field::<u8>(5).unwrap(), 255);
-    assert_eq!(*view.get_field::<u16>(6).unwrap(), 65535);
-    assert_eq!(*view.get_field::<u32>(7).unwrap(), 4294967295);
-    assert_eq!(*view.get_field::<u64>(8).unwrap(), 18446744073709551615);
+    // Some of these fields land at addresses unaligned for their type in
+    // this packed layout; get_field correctly rejects those, so this test
+    // uses get_field_unaligned throughout to exercise both accessors'
+    // correctness without hand-verifying alignment per field.
+    assert_eq!(view.get_field_unaligned::<i8>(1).unwrap(), -128);
+    assert_eq!(view.get_field_unaligned::<i16>(2).unwrap(), -32768);
+    assert_eq!(view.get_field_unaligned::<i32>(3).unwrap(), -2147483648);
+    assert_eq!(view.get_field_unaligned::<i64>(4).unwrap(), -9223372036854775808);
+    assert_eq!(view.get_field_unaligned::<u8>(5).unwrap(), 255);
+    assert_eq!(view.get_field_unaligned::<u16>(6).unwrap(), 65535);
+    assert_eq!(view.get_field_unaligned::<u32>(7).unwrap(), 4294967295);
+    assert_eq!(view.get_field_unaligned::<u64>(8).unwrap(), 18446744073709551615);
 }
 
 #[test]
@@ -410,8 +426,11 @@ fn test_all_float_types() {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer).unwrap();
 
-    let f32_val = *view.get_field::<f32>(1).unwrap();
-    let f64_val = *view.get_field::<f64>(2).unwrap();
+    // Whether a field's real address is aligned depends on the
+    // allocator's placement of the Vec, not just its file offset; use
+    // get_field_unaligned for both fields here.
+    let f32_val = view.get_field_unaligned::<f32>(1).unwrap();
+    let f64_val = view.get_field_unaligned::<f64>(2).unwrap();
     assert!((f32_val - 3.14159).abs() < 0.0001);
     assert!((f64_val - 2.718281828459045).abs() < 0.0000001);
 }
@@ -457,11 +476,13 @@ fn test_edge_case_values() {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer).unwrap();
 
-    assert_eq!(*view.get_field::<u64>(1).unwrap(), 0);
-    assert_eq!(*view.get_field::<u64>(2).unwrap(), u64::MAX);
-    assert_eq!(*view.get_field::<i64>(3).unwrap(), i64::MIN);
-    assert_eq!(*view.get_field::<f64>(4).unwrap(), 0.0);
-    assert!((*view.get_field::<f64>(5).unwrap() - (-123.456)).abs() < 0.0001);
+    // The 5-entry offset table shifts the data section to an address not
+    // a multiple of 8, so every 8-byte field here is unaligned.
+    assert_eq!(view.get_field_unaligned::<u64>(1).unwrap(), 0);
+    assert_eq!(view.get_field_unaligned::<u64>(2).unwrap(), u64::MAX);
+    assert_eq!(view.get_field_unaligned::<i64>(3).unwrap(), i64::MIN);
+    assert_eq!(view.get_field_unaligned::<f64>(4).unwrap(), 0.0);
+    assert!((view.get_field_unaligned::<f64>(5).unwrap() - (-123.456)).abs() < 0.0001);
 }
 
 #[test]
@@ -641,10 +662,12 @@ fn test_non_sequential_field_ids() {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer).unwrap();
 
-    assert_eq!(*view.get_field::<u32>(100).unwrap(), 100);
-    assert_eq!(*view.get_field::<u64>(50).unwrap(), 200);
-    assert_eq!(*view.get_field::<u32>(200).unwrap(), 300);
-    assert_eq!(*view.get_field::<u64>(1).unwrap(), 400);
+    // Real alignment depends on the allocator's placement of the Vec,
+    // not just file offset; see the note in test_roundtrip.
+    assert_eq!(view.get_field_unaligned::<u32>(100).unwrap(), 100);
+    assert_eq!(view.get_field_unaligned::<u64>(50).unwrap(), 200);
+    assert_eq!(view.get_field_unaligned::<u32>(200).unwrap(), 300);
+    assert_eq!(view.get_field_unaligned::<u64>(1).unwrap(), 400);
 }
 
 #[test]
@@ -659,7 +682,8 @@ fn test_multiple_modifications() {
     }
 
     let view = BinaryView::view(&buffer).unwrap();
-    assert_eq!(*view.get_field::<u32>(2).unwrap(), 29);
+    // See the allocator-alignment note in test_roundtrip.
+    assert_eq!(view.get_field_unaligned::<u32>(2).unwrap(), 29);
 }
 
 #[test]
@@ -720,8 +744,10 @@ fn test_many_fields() {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer).unwrap();
 
+    // Real alignment depends on the allocator's placement of the Vec,
+    // not just file offset; see the note in test_roundtrip.
     for i in 0..NUM_FIELDS {
-        let value = *view.get_field::<u32>(i as u32).unwrap();
+        let value = view.get_field_unaligned::<u32>(i as u32).unwrap();
         assert_eq!(value, (i * 100) as u32);
     }
 }
@@ -840,6 +866,344 @@ fn test_find_entry() {
     assert!(view.find_entry(3).is_some());
     assert!(view.find_entry(4).is_some());
     assert!(view.find_entry(999).is_none());
+}
+
+#[test]
+fn test_view_rejects_offset_table_size_not_multiple_of_entry_size() {
+    // offset_table_size = 13 is not a multiple of size_of::<OffsetEntry>()
+    // (12). Every existing length check (header size, total_size) passes
+    // for a buffer sized to match, and then bytemuck::cast_slice panics
+    // on the leftover byte instead of BinaryView::view returning Err.
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(13, 0, 0);
+    serializer.write_header(header);
+    serializer.write_data(&[0u8; 13]); // pad so buffer.len() >= total_size
+    let buffer = serializer.into_buffer();
+
+    match BinaryView::view(&buffer) {
+        Err(_) => {} // any error is fine; a panic is not
+        Ok(_) => panic!("expected an error for a malformed offset table size"),
+    }
+}
+
+#[test]
+fn test_header_total_size_does_not_overflow_u32_arithmetic() {
+    // header_size + offset_table_size + data_size + var_size must not be
+    // summed as u32 before widening to usize: u32::MAX-scale fields can
+    // wrap silently in release builds, making total_size() (and the
+    // buffer.len() < total_size guard in view()) pass when it should
+    // not.
+    let header = FormatHeader {
+        magic: bisere::format::MAGIC,
+        version: bisere::format::VERSION,
+        header_size: bisere::format::HEADER_SIZE as u32,
+        offset_table_size: u32::MAX - 10,
+        data_size: u32::MAX - 10,
+        var_size: u32::MAX - 10,
+        checksum: 0,
+        reserved: [0; 6],
+    };
+    // On 64-bit usize this must reflect the true (huge) sum, not a
+    // wrapped-around small number that a short buffer could satisfy.
+    assert!(header.total_size() > u32::MAX as usize);
+}
+
+#[test]
+fn test_reserve_does_not_change_serialized_output() {
+    // BinarySerializer::reserve is a pure pre-allocation hint (like
+    // Vec::reserve): calling it before the write_* sequence must produce
+    // byte-for-byte identical output to not calling it.
+    let data = TestData { id: 1, age: 2, score: 3.0, active: 1 };
+    let offset_table_size = 4 * std::mem::size_of::<OffsetEntry>() as u32;
+    let data_size = std::mem::size_of::<TestData>() as u32;
+    let header = FormatHeader::new(offset_table_size, data_size, 0);
+    let entries = [
+        OffsetEntry { field_id: 1, offset: 0, field_type: FieldType::Uint64 as u16, size: 8 },
+        OffsetEntry { field_id: 2, offset: 8, field_type: FieldType::Uint32 as u16, size: 4 },
+        OffsetEntry { field_id: 3, offset: 12, field_type: FieldType::Float64 as u16, size: 8 },
+        OffsetEntry { field_id: 4, offset: 20, field_type: FieldType::Uint8 as u16, size: 1 },
+    ];
+
+    let mut without_reserve = BinarySerializer::new();
+    without_reserve.write_header(header);
+    without_reserve.write_offset_table(&entries);
+    without_reserve.write_data(bytemuck::bytes_of(&data));
+    without_reserve.write_var_data(&[]);
+
+    let mut with_reserve = BinarySerializer::new();
+    with_reserve.reserve(header.total_size());
+    with_reserve.write_header(header);
+    with_reserve.write_offset_table(&entries);
+    with_reserve.write_data(bytemuck::bytes_of(&data));
+    with_reserve.write_var_data(&[]);
+
+    assert_eq!(without_reserve.into_buffer(), with_reserve.into_buffer());
+}
+
+#[test]
+fn test_view_unchecked_reads_a_wellformed_buffer_correctly() {
+    let buffer = create_test_buffer();
+    let view = BinaryView::view_unchecked(&buffer).unwrap();
+
+    // get_field_unaligned throughout: whether a field's real address is
+    // aligned depends on the allocator's placement of the Vec, not just
+    // its file offset — see the note in test_roundtrip.
+    let id: u64 = view.get_field_unaligned(1).unwrap();
+    assert_eq!(id, 12345);
+    let score: f64 = view.get_field_unaligned(3).unwrap();
+    assert_eq!(score, 95.5);
+}
+
+#[test]
+fn test_view_unchecked_still_rejects_malformed_offset_table_size() {
+    // view_unchecked skips magic/version/total_size validation, but must
+    // keep the offset_table_size % entry_size check — otherwise a
+    // malformed header reaches bytemuck::cast_slice and panics instead of
+    // returning an error, reopening the bug fixed in the soundness pass.
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(13, 0, 0);
+    serializer.write_header(header);
+    serializer.write_data(&[0u8; 13]);
+    let buffer = serializer.into_buffer();
+
+    match BinaryView::view_unchecked(&buffer) {
+        Err(SerializationError::InvalidOffsetTableSize { .. }) => {}
+        Err(e) => panic!("expected InvalidOffsetTableSize, got a different error: {}", e),
+        Ok(_) => panic!("expected InvalidOffsetTableSize, got Ok"),
+    }
+}
+
+#[test]
+fn test_view_unchecked_rejects_buffer_too_small_for_header() {
+    let buffer = vec![0u8; 10];
+    match BinaryView::view_unchecked(&buffer) {
+        Err(SerializationError::BufferTooSmall { needed, have }) => {
+            assert_eq!(needed, 80);
+            assert_eq!(have, 10);
+        }
+        Err(e) => panic!("expected BufferTooSmall, got a different error: {}", e),
+        Ok(_) => panic!("expected BufferTooSmall, got Ok"),
+    }
+}
+
+#[test]
+fn test_modify_string_zeros_trailing_bytes_on_shrink() {
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(1 * std::mem::size_of::<OffsetEntry>() as u32, 0, 10);
+    serializer.write_header(header);
+    let entries = vec![OffsetEntry { field_id: 10, offset: 0, field_type: FieldType::String as u16, size: 10 }];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    serializer.write_var_data(b"WorldWide\0"); // 9 bytes + NUL, fills the field
+
+    let mut buffer = serializer.into_buffer();
+    let mut view_mut = BinaryViewMut::view_mut(&mut buffer).unwrap();
+    view_mut.modify_string(10, "Hi").unwrap(); // shrink to 2 bytes
+
+    // Every byte past "Hi" in the field's 10-byte span must be zero, not
+    // leftover bytes from "WorldWide" — this is the property the
+    // fill-then-copy vs copy-then-fill reordering must preserve.
+    let var_start = header.var_section_offset();
+    assert_eq!(&buffer[var_start..var_start + 2], b"Hi");
+    assert!(buffer[var_start + 2..var_start + 10].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn test_modify_blob_zeros_trailing_bytes_on_shrink() {
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(1 * std::mem::size_of::<OffsetEntry>() as u32, 0, 10);
+    serializer.write_header(header);
+    let entries = vec![OffsetEntry { field_id: 20, offset: 0, field_type: FieldType::Blob as u16, size: 10 }];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    serializer.write_var_data(&[0xAAu8; 10]); // field fully "dirty"
+
+    let mut buffer = serializer.into_buffer();
+    let mut view_mut = BinaryViewMut::view_mut(&mut buffer).unwrap();
+    view_mut.modify_blob(20, &[1, 2, 3]).unwrap(); // shrink to 3 bytes
+
+    let var_start = header.var_section_offset();
+    assert_eq!(&buffer[var_start..var_start + 3], &[1, 2, 3]);
+    assert!(buffer[var_start + 3..var_start + 10].iter().all(|&b| b == 0));
+}
+
+#[test]
+fn test_serialize_to_buffer_matches_manual_serializer() {
+    // serialize_to_buffer is the one-call equivalent of writing header,
+    // offset table, data, and var sections through BinarySerializer in
+    // order; benches/serialization_bench.rs already depends on it
+    // existing with this signature.
+    let header = FormatHeader::new(
+        4 * std::mem::size_of::<OffsetEntry>() as u32,
+        std::mem::size_of::<TestData>() as u32,
+        0,
+    );
+    let entries = [
+        OffsetEntry { field_id: 1, offset: 0, field_type: FieldType::Uint64 as u16, size: 8 },
+        OffsetEntry { field_id: 2, offset: 8, field_type: FieldType::Uint32 as u16, size: 4 },
+        OffsetEntry { field_id: 3, offset: 12, field_type: FieldType::Float64 as u16, size: 8 },
+        OffsetEntry { field_id: 4, offset: 20, field_type: FieldType::Uint8 as u16, size: 1 },
+    ];
+    let data = TestData { id: 12345, age: 30, score: 95.5, active: 1 };
+
+    let via_helper = bisere::serialize_to_buffer(&header, &entries, bytemuck::bytes_of(&data), &[]);
+
+    let mut manual = BinarySerializer::new();
+    manual.write_header(header);
+    manual.write_offset_table(&entries);
+    manual.write_data(bytemuck::bytes_of(&data));
+    manual.write_var_data(&[]);
+    let via_manual = manual.into_buffer();
+
+    assert_eq!(via_helper, via_manual);
+
+    // And it must actually be readable back through BinaryView.
+    let view = BinaryView::view(&via_helper).unwrap();
+    assert_eq!(view.get_field_unaligned::<u64>(1).unwrap(), 12345);
+}
+
+#[test]
+fn test_get_string_does_not_read_past_entry_size() {
+    // Two adjacent String fields, neither null-terminated within its own
+    // declared size. get_string must stop at entry.size, not keep
+    // scanning into the next field's bytes looking for a NUL.
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(2 * std::mem::size_of::<OffsetEntry>() as u32, 0, 10);
+    serializer.write_header(header);
+
+    let entries = vec![
+        OffsetEntry { field_id: 1, offset: 0, field_type: FieldType::String as u16, size: 5 },
+        OffsetEntry { field_id: 2, offset: 5, field_type: FieldType::String as u16, size: 5 },
+    ];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    // Neither 5-byte region contains a NUL anywhere.
+    serializer.write_var_data(b"AAAAABBBBB");
+
+    let buffer = serializer.into_buffer();
+    let view = BinaryView::view(&buffer).unwrap();
+
+    assert_eq!(view.get_string(1).unwrap(), "AAAAA");
+}
+
+#[test]
+fn test_get_string_out_of_bounds_offset_returns_error_not_panic() {
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(1 * std::mem::size_of::<OffsetEntry>() as u32, 0, 4);
+    serializer.write_header(header);
+
+    let entries = vec![OffsetEntry {
+        field_id: 1,
+        offset: 1000, // pushes string_offset past the buffer entirely
+        field_type: FieldType::String as u16,
+        size: 4,
+    }];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    serializer.write_var_data(&[0u8; 4]);
+
+    let buffer = serializer.into_buffer();
+    let view = BinaryView::view(&buffer).unwrap();
+
+    assert!(view.get_string(1).is_err());
+}
+
+#[test]
+fn test_get_string_invalid_utf8_returns_invalid_utf8_error() {
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(1 * std::mem::size_of::<OffsetEntry>() as u32, 0, 4);
+    serializer.write_header(header);
+
+    let entries = vec![OffsetEntry {
+        field_id: 1,
+        offset: 0,
+        field_type: FieldType::String as u16,
+        size: 4,
+    }];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    serializer.write_var_data(&[0xFF, 0xFE, 0x00, 0x00]); // invalid UTF-8, NUL-terminated
+
+    let buffer = serializer.into_buffer();
+    let view = BinaryView::view(&buffer).unwrap();
+
+    match view.get_string(1) {
+        Err(SerializationError::InvalidUtf8 { field_id }) => assert_eq!(field_id, 1),
+        other => panic!("expected InvalidUtf8, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_modify_field_rejects_variable_length_field_type() {
+    // A field declared as String must not be writable through
+    // modify_field: that would overwrite the var-section bytes as raw
+    // POD data, bypassing the size/NUL-terminator rules modify_string
+    // enforces.
+    let mut serializer = BinarySerializer::new();
+    let header = FormatHeader::new(1 * std::mem::size_of::<OffsetEntry>() as u32, 0, 8);
+    serializer.write_header(header);
+
+    let entries = vec![OffsetEntry {
+        field_id: 1,
+        offset: 0,
+        field_type: FieldType::String as u16,
+        size: 8,
+    }];
+    serializer.write_offset_table(&entries);
+    serializer.write_data(&[]);
+    serializer.write_var_data(&[0u8; 8]);
+
+    let mut buffer = serializer.into_buffer();
+    let mut view_mut = BinaryViewMut::view_mut(&mut buffer).unwrap();
+
+    let value = 0xFFFFFFFFFFFFFFFFu64; // matches entry.size (8), wrong field_type
+    assert!(view_mut.modify_field(1, &value).is_err());
+}
+
+#[test]
+fn test_get_field_rejects_unaligned_field() {
+    let buffer = create_test_buffer();
+    let view = BinaryView::view(&buffer).unwrap();
+
+    // score (field_id 3) is an f64 that lands at an address not a
+    // multiple of 8 in this layout. get_field must reject it instead of
+    // creating a misaligned &f64 (which is UB and aborts the process on
+    // current rustc). get_field_unaligned is the correct escape hatch.
+    match view.get_field::<f64>(3) {
+        Err(SerializationError::UnalignedField { field_id, .. }) => {
+            assert_eq!(field_id, 3);
+        }
+        other => panic!("expected UnalignedField error, got {:?}", other),
+    }
+
+    let score = view.get_field_unaligned::<f64>(3).unwrap();
+    assert_eq!(score, 95.5);
+}
+
+#[test]
+fn test_view_mut_no_aliasing_ub() {
+    // BinaryViewMut must not hold overlapping &mut references into the
+    // same buffer (header/offset_table as separate &mut fields aliasing
+    // `buffer` is UB). Exercising find_entry (reads the table) and
+    // modify_field (writes through buffer) in the same view is exactly
+    // the access pattern that trips Stacked/Tree Borrows under Miri if
+    // the references overlap. Run under `cargo +nightly miri test` to
+    // check.
+    let mut buffer = create_test_buffer();
+    let mut view_mut = BinaryViewMut::view_mut(&mut buffer).unwrap();
+
+    assert!(view_mut.find_entry(1).is_some());
+    let new_age = 40u32;
+    view_mut.modify_field(2, &new_age).unwrap();
+    assert!(view_mut.find_entry(2).is_some());
+
+    // get_field_unaligned rather than get_field: this test is about
+    // aliasing in BinaryViewMut, not about get_field's alignment check
+    // (test_get_field_rejects_unaligned_field covers that) — and whether
+    // this field is aligned depends on the allocator's placement of the
+    // Vec, which Miri deliberately does not over-align.
+    let view = BinaryView::view(&buffer).unwrap();
+    assert_eq!(view.get_field_unaligned::<u32>(2).unwrap(), 40);
 }
 
 #[test]

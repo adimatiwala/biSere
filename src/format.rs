@@ -68,25 +68,50 @@ impl FormatHeader {
                 found: self.magic,
             });
         }
-        
+
         if self.version != VERSION {
             return Err(SerializationError::UnsupportedVersion {
                 version: self.version,
             });
         }
-        
+
+        if self.header_size as usize != HEADER_SIZE {
+            return Err(SerializationError::InvalidHeaderSize {
+                expected: HEADER_SIZE,
+                found: self.header_size as usize,
+            });
+        }
+
+        let entry_size = std::mem::size_of::<OffsetEntry>();
+        if self.offset_table_size as usize % entry_size != 0 {
+            return Err(SerializationError::InvalidOffsetTableSize {
+                size: self.offset_table_size as usize,
+                entry_size,
+            });
+        }
+
         Ok(())
     }
-    
+
+    /// Sum of all four section sizes, in bytes.
+    ///
+    /// Each field is widened to `usize` and added with saturation before
+    /// any addition happens in `u32`, so a buffer describing more data
+    /// than can exist can't wrap around to a small value and defeat the
+    /// `buffer.len() < total_size` bounds check callers rely on — it
+    /// saturates to `usize::MAX` instead, which no real buffer satisfies.
     pub fn total_size(&self) -> usize {
-        (self.header_size + self.offset_table_size + self.data_size + self.var_size) as usize
+        (self.header_size as usize)
+            .saturating_add(self.offset_table_size as usize)
+            .saturating_add(self.data_size as usize)
+            .saturating_add(self.var_size as usize)
     }
-    
+
     pub fn data_section_offset(&self) -> usize {
-        (self.header_size + self.offset_table_size) as usize
+        (self.header_size as usize).saturating_add(self.offset_table_size as usize)
     }
-    
+
     pub fn var_section_offset(&self) -> usize {
-        self.data_section_offset() + self.data_size as usize
+        self.data_section_offset().saturating_add(self.data_size as usize)
     }
 }
