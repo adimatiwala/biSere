@@ -398,10 +398,10 @@ cargo bench --bench varying_sizes_bench
 
 2. **`varying_sizes_bench`**: Performance with varying data sizes (1, 10, 100, 1000 structs).
 
-**Expected Results:**
-- biSere demonstrates superior performance in deserialization operations (zero-copy) and field access
-- biSere demonstrates superior performance in in-place modification operations (no re-serialization required)
-- biSere may exhibit slower performance during initial serialization due to offset table setup overhead
+**Results** (see [BENCHMARKS.md](BENCHMARKS.md) for the full numbers and methodology):
+- biSere is fastest at zero-copy field access (reading a field without deserializing the whole struct) and in-place modification (updating a field without a deserialize/serialize round trip) — the two operations its format is built for.
+- biSere is *not* the fastest at serialize, general-API deserialize (`BinaryView::view()`), or round-trip; bincode is faster at all three for this struct. Its offset table and header are overhead that only pays off across the reads/modifications that follow one serialize.
+- biSere is slower than bincode/postcard for batch-serializing many structs, and produces a larger buffer than postcard/messagepack/bincode for this struct (fixed header + offset table cost).
 
 See `benches/README.md` for detailed benchmark documentation and `BENCHMARKS.md` for comprehensive benchmark results and analysis.
 

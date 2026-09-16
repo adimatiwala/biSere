@@ -46,8 +46,32 @@ fn bisere_serialize(data: &UserData) -> Vec<u8> {
     bisere::serialize_to_buffer(&BISERE_HEADER, &BISERE_ENTRIES, bytemuck::bytes_of(data), &[])
 }
 
-// Layout-specific deserialize: data section at 128, offsets 0,8,12,20. No view, no table lookup.
+// Deserialize through the real BinaryView API — this is what "deserialize a
+// buffer" means for a caller who doesn't already have a view: validate,
+// then look up and read each field. Uses get_field_unaligned throughout:
+// whether a field's real address is aligned for its type depends on where
+// the allocator places the buffer, not just its file offset (see the
+// get_field vs get_field_unaligned distinction in the docs), so this is
+// the portable choice rather than risking a panic on some allocator.
 fn bisere_deserialize(buffer: &[u8]) -> (u64, u32, f64, u8) {
+    let view = BinaryView::view(buffer).unwrap();
+    (
+        view.get_field_unaligned(1).unwrap(),
+        view.get_field_unaligned(2).unwrap(),
+        view.get_field_unaligned(3).unwrap(),
+        view.get_field_unaligned(4).unwrap(),
+    )
+}
+
+// Layout-specific fast path: for a buffer whose exact layout is known ahead
+// of time (fixed 4-entry offset table, data section at a compile-time-known
+// offset), skip BinaryView and the offset table entirely and read the four
+// fields directly. A legitimate technique for a known-fixed-format hot
+// path — but it is not representative of "biSere's deserialize
+// performance" in general, since it bypasses validation and field lookup;
+// see `bisere` (above) for the number that actually reflects the public
+// API a caller who doesn't already know the layout would use.
+fn bisere_deserialize_layout_specific(buffer: &[u8]) -> (u64, u32, f64, u8) {
     const DATA_OFF: usize = HEADER_SIZE + 4 * std::mem::size_of::<OffsetEntry>();
     unsafe {
         let p = buffer.as_ptr().add(DATA_OFF);
@@ -146,7 +170,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.bench_function("bisere", |b| {
         b.iter(|| bisere_deserialize(black_box(&bisere_buf)))
     });
-    
+
+    // Not a general "biSere deserialize" number — see the function doc.
+    // Kept separate and clearly labeled rather than folded into "bisere".
+    group.bench_function("bisere_layout_specific", |b| {
+        b.iter(|| bisere_deserialize_layout_specific(black_box(&bisere_buf)))
+    });
+
     group.bench_function("bincode", |b| {
         b.iter(|| bincode_deserialize(black_box(&bincode_buf)))
     });

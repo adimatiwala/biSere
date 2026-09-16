@@ -2,23 +2,34 @@
 
 This document presents comprehensive performance benchmarks comparing biSere against other popular Rust serialization libraries: bincode, postcard, MessagePack (rmp-serde), and serde_json.
 
-## Recent results (after optimizations)
+## Recent results
 
-| Category        | biSere    | Rank | Beats                          |
+| Category        | biSere    | Rank | vs. fastest binary alternative |
 |----------------|-----------|------|--------------------------------|
-| **Serialize**  | ~29 ns    | **1st** | bincode (~31 ns), postcard (~54 ns), messagepack, serde_json |
-| **Deserialize** | ~2.44 ns | **1st** | bincode (~4.5 ns), postcard (~6.3 ns) (layout-specific 4× read_unaligned) |
-| **Round-trip** | ~28.4 ns  | **1st** | bincode (~35 ns), postcard (~61 ns), messagepack |
-| **Field access** | ~2.1 ns | **1st** | bincode (~5.5 ns), postcard (~5.7 ns) |
-| **In-place**   | ~30 ns    | **1st** (tie) | postcard (~55 ns)        |
+| **Serialize**  | ~26 ns    | 2nd | bincode ~21 ns (bincode faster) |
+| **Deserialize** (via `BinaryView`, the public API) | ~8.6 ns | **Last** of the binary formats | bincode ~4.5 ns, postcard ~6.5 ns (both faster) |
+| **Round-trip** | ~52 ns  | 2nd | bincode ~26 ns (bincode faster) |
+| **Field access** (zero-copy read) | ~3.9 ns | **1st** | beats bincode ~6.0 ns, postcard ~5.7 ns |
+| **In-place modification** | ~4.9 ns | **1st**, by a wide margin | beats bincode's re-serialize ~23.8 ns (~4.8×) |
 
-Optimizations: **Serialize:** const header + const offset table + `serialize_to_buffer` (one alloc, four copies). **Deserialize:** layout-specific fast path (data section at 128, four `read_unaligned`); for generic buffers use `BinaryView::view` or `view_unchecked`. **Field access:** dense 1-based → O(1) indexing. **Round-trip:** benefits from fast serialize + fast deserialize.
+**biSere wins 2 of these 5 categories** — field access and in-place modification, the two
+that measure what its architecture is actually for (read/patch a buffer without a full
+deserialize cycle). It is not the fastest at serialize, general-API deserialize, or
+round-trip; bincode is faster at all three. A `bisere_deserialize_layout_specific`
+benchmark exists that beats everyone at ~2.5 ns by skipping `BinaryView` and the offset
+table entirely for a compile-time-known fixed layout — that's a real, usable technique
+for a hot path where you control both ends and know the exact layout ahead of time, but
+it is not what `BinaryView::view()` does, and it's kept as a separate, clearly-labeled
+row rather than reported as "biSere's deserialize performance." See the
+[Deserialization Performance](#2-deserialization-performance) section below for why
+that distinction matters.
 
 ### Can biSere be fastest in every category?
 
-- **Yes in all 5 categories:** Serialize (1st), Deserialize (1st), Round-trip (1st), Field access (1st), In-place (1st). Latest run: biSere ~29 ns serialize vs bincode ~31 ns.
-- **Buffer size:** No. The format needs a fixed header and offset table for zero-copy and in-place; we cannot be smallest without changing the format.
-- **Varying sizes (batch):** We use one header/table per buffer; to win batch serialize we’d need a different batch format.
+No, and that's fine — it isn't the goal. The two categories biSere wins (field access,
+in-place modification) are the two the architecture is built for. Serialize,
+deserialize, round-trip, buffer size, and batch serialization are all slower than at
+least one alternative — the direct cost of the fixed header + offset table format.
 
 ## Implementation Optimizations: Before / After
 
@@ -104,17 +115,21 @@ Time required to convert data structures into serialized byte buffers.
 
 | Library | Time (ns) | Throughput (Melem/s) | Rank |
 |---------|-----------|----------------------|------|
-| **biSere** | 29.12 | 34.35 | 1st |
-| **bincode** | 30.89 | 32.38 | 2nd |
-| **postcard** | 54.43 | 18.37 | 3rd |
-| **messagepack** | 54.74 | 18.27 | 4th |
-| **serde_json** | 92.99 | 10.75 | 5th |
+| **bincode** | 21.0 | 47.7 | 1st |
+| **biSere** | 25.9 | 38.9 | 2nd |
+| **messagepack** | 46.9 | 21.3 | 3rd |
+| **postcard** | 58.4 | 17.3 | 4th |
+| **serde_json** | 87.3 | 11.4 | 5th |
 
 ### Analysis
 
-biSere is **1st** in serialization (~29 ns). Const header + const offset table with `serialize_to_buffer` give one allocation and four copies. The offset table and format header enable subsequent zero-copy and in-place operations.
+biSere is **2nd**, behind bincode. `serialize_to_buffer` (const header + const offset
+table, one allocation, four copies) is efficient, but bincode's serde-based path is
+still faster for this small a struct — consistently ~20% faster across repeated runs.
 
-**Key Insight**: Serialization overhead is amortized over multiple read and modification operations.
+**Key Insight**: Serialization isn't where biSere's advantage lives. Its offset table
+and format header exist to enable the zero-copy and in-place operations measured in
+sections 4 and 5, which is where the actual win is.
 
 ---
 
@@ -122,19 +137,45 @@ biSere is **1st** in serialization (~29 ns). Const header + const offset table w
 
 Time required to read data from serialized byte buffers.
 
+The benchmark measures two distinct biSere paths, reported as separate rows:
+`bisere` calls `BinaryView::view(buffer)` followed by four `get_field_unaligned`
+calls — what a caller without prior knowledge of the layout does to deserialize a
+buffer through the public API. `bisere_layout_specific` skips `BinaryView` and the
+offset table entirely, reading four fields via `ptr::read_unaligned` at a
+compile-time-known fixed offset — a legitimate technique when the caller controls both
+ends and knows the exact layout ahead of time, but a different thing from deserializing
+through the format.
+
 | Library | Time (ns) | Throughput (Melem/s) | Rank |
 |---------|-----------|----------------------|------|
-| **biSere** | 2.44 | 409.89 | 1st |
-| **bincode** | 4.48 | 222.98 | 2nd |
-| **postcard** | 6.32 | 158.27 | 3rd |
-| **messagepack** | 19.25 | 51.94 | 4th |
-| **serde_json** | 75.99 | 13.16 | 5th |
+| **biSere** (`bisere_layout_specific`, known layout, bypasses `BinaryView`) | 2.5 | 400 | — *(not a fair comparison; see below)* |
+| **bincode** | 4.5 | 222 | 1st |
+| **postcard** | 6.5 | 154 | 2nd |
+| **biSere** (`bisere`, via `BinaryView::view()`, the public API) | 8.6 | 116 | **3rd — last of the binary formats** |
+| **messagepack** | 15.9 | 63 | 4th |
+| **serde_json** | 78.0 | 12.8 | 5th |
 
 ### Analysis
 
-biSere is **1st** in deserialization (~2.44 ns). The benchmark uses a layout-specific fast path (data section at fixed offset, four `read_unaligned`); for generic buffers use `BinaryView::view` or `view_unchecked`. biSere enables zero-copy field access without full deserialization.
+Measured honestly, biSere's general-purpose deserialize path is **the slowest of the
+three binary formats** — slower than both bincode and postcard. This isn't a bug to
+fix; it's the direct cost of `view()`'s validation (magic, version, header size, offset
+table size, total size) plus an offset-table lookup per field, none of which bincode or
+postcard's direct serde deserialization pays. `view_unchecked()` (see the
+["Implementation Optimizations"](#implementation-optimizations-before--after) section
+above) shaves a small amount off the validation, not enough to close a 2-4 ns gap.
 
-**Key Insight**: With a known layout, biSere can read fields with minimal work; the generic view path still enables zero-copy operations.
+The layout-specific row is real and useful for a caller who controls both ends and
+knows the exact fixed layout at compile time — it's ~1.8× faster than bincode. But it
+isn't "biSere," any more than a `bincode` caller who memcpy'd known struct offsets out
+of a buffer would be "bincode's" performance. It bypasses the thing that makes biSere a
+format (the offset table, field IDs, validation) rather than a raw memory layout
+convention.
+
+**Key Insight**: Don't choose biSere for deserialize speed — choose bincode or postcard
+for that. Choose biSere when you need to read individual fields selectively without
+deserializing the whole struct (section 4) or modify fields in place without a
+deserialize/serialize round trip (section 5); those are where the real advantage is.
 
 ---
 
@@ -144,16 +185,24 @@ Complete serialize-then-deserialize cycle.
 
 | Library | Time (ns) | Throughput (Melem/s) | Rank |
 |---------|-----------|----------------------|------|
-| **biSere** | 28.43 | 35.18 | 1st |
-| **bincode** | 35.13 | 28.47 | 2nd |
-| **postcard** | 61.33 | 16.31 | 3rd |
-| **messagepack** | ~73 | ~14 | 4th |
+| **bincode** | 26.1 | 38.3 | 1st |
+| **biSere** | 52.0 | 19.7 | 2nd |
+| **postcard** | 62.9 | 15.9 | 3rd |
+| **messagepack** | 63.7 | 15.7 | 4th |
+
+This uses `bisere_deserialize` (the `BinaryView::view()` path), so it reflects the same
+serialize + deserialize costs as sections 1 and 2 combined.
 
 ### Analysis
 
-biSere is **1st** in round-trip (~28.4 ns). Fast serialization and layout-specific deserialization combine to beat bincode and others.
+biSere is **2nd**, behind bincode by roughly 2×. Its serialize is already slower than
+bincode's (section 1), and its deserialize is the slowest of the three binary formats
+(section 2), so round-trip compounds both.
 
-**Key Insight**: Round-trip is less relevant for biSere's target use cases, where data is serialized once and accessed/modified many times.
+**Key Insight**: Round-trip isn't biSere's use case — it measures serialize-once,
+read-once, discard, which is exactly the pattern where a fixed header and offset table
+buy nothing. biSere's advantage shows up when a buffer is read or modified many times
+after one serialize (sections 4 and 5).
 
 ---
 
@@ -163,13 +212,13 @@ Performance of accessing individual fields without full deserialization.
 
 | Library | Method | Time (ns) | Throughput (Melem/s) | Rank |
 |---------|--------|-----------|----------------------|------|
-| **biSere** | Zero-copy | 2.17 | 460.24 | 1st |
-| **bincode** | Full deserialize | 5.57 | 179.40 | 2nd |
-| **postcard** | Full deserialize | 5.91 | 169.22 | 3rd |
+| **biSere** | Zero-copy | 3.9 | 254 | 1st |
+| **postcard** | Full deserialize | 5.7 | 176 | 2nd |
+| **bincode** | Full deserialize | 6.0 | 166 | 3rd |
 
 ### Analysis
 
-biSere is **1st** in field access by a wide margin (~2.2 ns vs ~5.6 ns for bincode). With dense 1-based field IDs, `find_entry` uses O(1) direct indexing and no allocation. biSere also provides:
+biSere is **1st** in field access (~3.9 ns vs ~5.7-6.0 ns for bincode/postcard). With dense 1-based field IDs, `find_entry` uses O(1) direct indexing and no allocation. biSere also provides:
 
 - **No allocation**: Returns references directly into the buffer
 - **Selective access**: Access only needed fields without deserializing the entire structure
@@ -185,15 +234,15 @@ Performance of updating fields in serialized buffers.
 
 | Library | Method | Time (ns) | Throughput (Melem/s) | Notes |
 |---------|--------|-----------|----------------------|-------|
-| **bincode** | Re-serialize | 29.50 | 33.89 | Full re-serialize |
-| **biSere** | In-place | 30.33 | 32.98 | No re-serialize |
-| **postcard** | Re-serialize | 54.53 | 18.34 | Full re-serialize |
+| **biSere** | In-place | 4.9 | 202 | No re-serialize |
+| **bincode** | Re-serialize | 23.8 | 42.0 | Full re-serialize |
+| **postcard** | Re-serialize | 61.9 | 16.1 | Full re-serialize |
 
 ### Analysis
 
-**biSere in-place is on par with bincode re-serialize** (~30 ns) and **~1.8x faster than postcard re-serialize**. In-place updates use direct memory writes with no deserialization or re-serialization.
+**biSere in-place is ~4.8× faster than bincode's re-serialize** and **~12.6× faster than postcard's**. In-place updates use a direct memory write (`ptr::write_unaligned`) with no deserialization or re-serialization at all — this is the clearest, widest margin in the whole comparison, and it's the operation biSere's format exists for.
 
-**Key Insight**: For applications requiring frequent field updates (e.g., game engines, real-time systems, databases), biSere avoids re-serialization overhead and stays competitive with the fastest full re-serialize.
+**Key Insight**: For applications requiring frequent field updates (e.g., game engines, real-time systems, databases), this is where biSere's fixed header and offset table pay for themselves — every other category in this document is a cost that gets amortized across however many in-place modifications a buffer sees after being serialized once.
 
 ---
 
@@ -275,16 +324,16 @@ biSere's serialization scales linearly with the number of elements. The per-stru
 
 ### Where biSere Excels
 
-1. **Serialize**: **1st** — ~29 ns (const header + `serialize_to_buffer`)
-2. **Deserialize**: **1st** — ~2.44 ns (layout-specific fast path)
-3. **Round-Trip**: **1st** — ~28.4 ns
-4. **Field Access**: **1st** — ~2.2 ns zero-copy vs ~5.6 ns full deserialize (bincode/postcard)
-5. **In-Place Modification**: **1st** (tie) — ~30 ns, on par with bincode re-serialize, ~1.8x faster than postcard
+1. **In-Place Modification**: **1st**, by a wide margin — ~4.9 ns vs ~23.8 ns for bincode's re-serialize (~4.8×), ~61.9 ns for postcard's (~12.6×)
+2. **Field Access**: **1st** — ~3.9 ns zero-copy vs ~5.7-6.0 ns full deserialize (postcard/bincode)
 
 ### Where biSere is Slower
 
-1. **Varying sizes (batch)**: Slower than bincode/postcard when serializing many structs (offset table per buffer)
-2. **Buffer Size**: 12.4x larger than the smallest format (enables zero-copy operations)
+1. **Serialize**: 2nd — bincode is ~20% faster (~21 ns vs ~26 ns)
+2. **Deserialize** (via the public `BinaryView::view()` API): last of the binary formats — bincode (~4.5 ns) and postcard (~6.5 ns) are both faster than biSere (~8.6 ns). A layout-specific bypass exists that beats everyone at ~2.5 ns, but it isn't a deserialize through the format — see [section 2](#2-deserialization-performance)
+3. **Round-Trip**: 2nd — bincode is ~2× faster (~26 ns vs ~52 ns), compounding the serialize and deserialize gaps above
+4. **Varying sizes (batch)**: slower than bincode/postcard when serializing many structs (offset table per buffer)
+5. **Buffer Size**: 12.4× larger than the smallest format (postcard) for this struct
 
 ### Recommended Use Cases
 
@@ -363,7 +412,7 @@ This section surveys other Rust binary (and related) serializers not included in
 
 ### How biSere compares
 
-- **vs bincode / postcard / MessagePack**: biSere adds **zero-copy field access** and **in-place modification**. In this repo’s benchmarks (single small struct, fixed layout), biSere is first in serialize, deserialize, round-trip, field access, and in-place. bincode/postcard win on **wire size** and on **batch** serialization of many structs (one stream vs one buffer per struct).
+- **vs bincode / postcard / MessagePack**: biSere adds **zero-copy field access** and **in-place modification** — the two categories it wins in this repo's benchmarks (single small struct, fixed layout). bincode is faster at serialize, deserialize, and round-trip; bincode/postcard also win on **wire size** and on **batch** serialization of many structs (one stream vs one buffer per struct).
 - **vs rkyv**: Both offer zero-copy and mutation. rkyv is more mature, has an open type system (e.g. collections), and excels in larger/published benchmarks. biSere is **Rust-only**, **POD + offset-table** based, with a fixed 80-byte header and explicit field IDs; it’s a good fit when you want a simple, predictable layout and minimal dependencies (e.g. bytemuck, no external schema).
 - **vs FlatBuffers / Cap'n Proto**: Those are schema-driven and cross-language; biSere is Rust-centric with no IDL. biSere’s format is simpler (header + offset table + data); you trade schema evolution and cross-language for simplicity and, in this benchmark setup, very low latency.
 - **vs Abomonation**: Abomonation can be faster on raw encode/decode but is **not portable** and doesn’t support in-place mutation. biSere is portable and supports in-place updates.
@@ -377,14 +426,21 @@ biSere sits in the **zero-copy + in-place** niche: it competes with rkyv and (co
 
 ## Conclusion
 
-biSere leads in all five benchmark categories (serialize, deserialize, round-trip, field access, in-place) while providing zero-copy deserialization and in-place modification. Const header/table and `serialize_to_buffer` yield the fastest serialize; a layout-specific or `view_unchecked` path yields the fastest deserialize.
+biSere wins 2 of the 5 benchmark categories here — field access and in-place
+modification — by wide margins (1.5-2× and 4.8-12.6× respectively). It loses serialize,
+deserialize, and round-trip to bincode, and loses buffer size and batch serialization to
+both bincode and postcard.
 
 The library's design prioritizes:
-1. **End-to-end speed** — first in serialize, deserialize, and round-trip in the benchmark setup
-2. **Zero-copy operations** over minimal buffer size
+1. **Zero-copy field access and in-place modification** — the operations a fixed header
+   and offset table are built to support, and the two places that investment pays off
+2. **Predictable, explicit layout** (POD types, field IDs, `bytemuck`) over minimal wire
+   size or serialize/deserialize throughput
 3. **Type safety** through Rust's type system
 
-For modification-heavy and read-heavy workloads, biSere offers the best performance among the compared libraries.
+Choose biSere for workloads that serialize once and then read or modify fields many
+times afterward. For write-once/read-once, read-many-without-modification, batch
+serialization of many records, or minimal wire size, bincode or postcard are faster.
 
 ---
 
