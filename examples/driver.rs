@@ -337,13 +337,15 @@ fn test_basic_serialization() -> Result<()> {
     let view = BinaryView::view(&buffer)?;
     let id: &u64 = view.get_field(1)?;
     let age: &u32 = view.get_field(2)?;
-    let score: &f64 = view.get_field(3)?;
+    // score (f64) lands at an address unaligned for f64 in this layout;
+    // get_field_unaligned is the correct accessor (get_field would
+    // return UnalignedField rather than risk creating an invalid &f64).
+    let score_val: f64 = view.get_field_unaligned(3)?;
     let active: &u8 = view.get_field(4)?;
 
     // Copy values to avoid alignment issues with packed structs
     let id_val = *id;
     let age_val = *age;
-    let score_val = *score;
     let active_val = *active;
     let user_id = user.id;
     let user_age = user.age;
@@ -414,7 +416,8 @@ fn test_inplace_modification() -> Result<()> {
     // Verify modifications
     let view = BinaryView::view(&buffer)?;
     assert_eq!(*view.get_field::<u32>(2)?, new_age, "Age modification failed");
-    assert_eq!(*view.get_field::<f64>(3)?, new_score, "Score modification failed");
+    // score (f64) is unaligned in this layout; see test_basic_serialization.
+    assert_eq!(view.get_field_unaligned::<f64>(3)?, new_score, "Score modification failed");
     assert_eq!(*view.get_field::<u8>(4)?, new_active, "Active modification failed");
 
     println!("│ Modified: Age={}, Score={}, Active={}", new_age, new_score, new_active != 0);
@@ -632,14 +635,15 @@ fn test_mixed_fields() -> Result<()> {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer)?;
 
-    let id: &u64 = view.get_field(1)?;
+    // id (u64) is unaligned in this 5-entry-table layout; see
+    // test_basic_serialization for why get_field_unaligned is used.
+    let id_val: u64 = view.get_field_unaligned(1)?;
     let age: &u32 = view.get_field(2)?;
     let score: &f64 = view.get_field(3)?;
     let active: &u8 = view.get_field(4)?;
     let name_str = view.get_string(10)?;
 
     // Copy values to avoid alignment issues
-    let id_val = *id;
     let age_val = *age;
     let score_val = *score;
     let active_val = *active;
@@ -654,8 +658,8 @@ fn test_mixed_fields() -> Result<()> {
     assert_eq!(active_val, user_active);
     assert_eq!(name_str, name);
 
-    println!("│ Mixed fields: ID={}, Age={}, Score={}, Active={}, Name='{}'", 
-             id, age, score, *active != 0, name_str);
+    println!("│ Mixed fields: ID={}, Age={}, Score={}, Active={}, Name='{}'",
+             id_val, age, score, *active != 0, name_str);
     Ok(())
 }
 
@@ -831,14 +835,17 @@ fn test_all_integer_types() -> Result<()> {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer)?;
 
-    let i8_val = *view.get_field::<i8>(1)?;
-    let i16_val = *view.get_field::<i16>(2)?;
-    let i32_val = *view.get_field::<i32>(3)?;
-    let i64_val = *view.get_field::<i64>(4)?;
-    let u8_val = *view.get_field::<u8>(5)?;
-    let u16_val = *view.get_field::<u16>(6)?;
-    let u32_val = *view.get_field::<u32>(7)?;
-    let u64_val = *view.get_field::<u64>(8)?;
+    // Several of these fields land at addresses unaligned for their type
+    // in this packed layout; get_field_unaligned throughout sidesteps
+    // having to verify alignment per field (see test_basic_serialization).
+    let i8_val = view.get_field_unaligned::<i8>(1)?;
+    let i16_val = view.get_field_unaligned::<i16>(2)?;
+    let i32_val = view.get_field_unaligned::<i32>(3)?;
+    let i64_val = view.get_field_unaligned::<i64>(4)?;
+    let u8_val = view.get_field_unaligned::<u8>(5)?;
+    let u16_val = view.get_field_unaligned::<u16>(6)?;
+    let u32_val = view.get_field_unaligned::<u32>(7)?;
+    let u64_val = view.get_field_unaligned::<u64>(8)?;
 
     assert_eq!(i8_val, -128);
     assert_eq!(i16_val, -32768);
@@ -894,11 +901,14 @@ fn test_edge_case_values() -> Result<()> {
     let buffer = serializer.into_buffer();
     let view = BinaryView::view(&buffer)?;
 
-    let zero_u64 = *view.get_field::<u64>(1)?;
-    let max_u64 = *view.get_field::<u64>(2)?;
-    let min_i64 = *view.get_field::<i64>(3)?;
-    let zero_f64 = *view.get_field::<f64>(4)?;
-    let neg_f64 = *view.get_field::<f64>(5)?;
+    // The 5-entry offset table shifts the data section to an address not
+    // a multiple of 8, so every field here is unaligned; see
+    // test_basic_serialization for why get_field_unaligned is used.
+    let zero_u64 = view.get_field_unaligned::<u64>(1)?;
+    let max_u64 = view.get_field_unaligned::<u64>(2)?;
+    let min_i64 = view.get_field_unaligned::<i64>(3)?;
+    let zero_f64 = view.get_field_unaligned::<f64>(4)?;
+    let neg_f64 = view.get_field_unaligned::<f64>(5)?;
 
     assert_eq!(zero_u64, 0);
     assert_eq!(max_u64, u64::MAX);
@@ -1102,7 +1112,8 @@ fn test_non_sequential_field_ids() -> Result<()> {
     let view = BinaryView::view(&buffer)?;
 
     let v100 = *view.get_field::<u32>(100)?;
-    let v50 = *view.get_field::<u64>(50)?;
+    // field 50 (u64) is unaligned in this layout; see test_basic_serialization.
+    let v50 = view.get_field_unaligned::<u64>(50)?;
     let v200 = *view.get_field::<u32>(200)?;
     let v1 = *view.get_field::<u64>(1)?;
 

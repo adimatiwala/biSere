@@ -7,8 +7,9 @@
 **Disclaimer**: This project was developed as a side project for educational and experimental purposes. While the library demonstrates promising performance characteristics in specific use cases (particularly in-place modification), performance optimizations and additional features are still under development. Please be aware of this:
 
 - Performance may not match production-grade serialization libraries in all scenarios
-- Additional features and optimizations are planned (see Future Improvements section)
+- Additional features and optimizations are planned (see [IMPROVEMENTS.md](IMPROVEMENTS.md))
 - The library is suitable for experimentation and specific use cases, but may require further development for production use
+- For a concrete path to production readiness, see [PRODUCTION.md](PRODUCTION.md)
 
 ## Overview
 
@@ -115,7 +116,7 @@ struct OffsetEntry {
 
 ### Design Decisions
 
-- **Offset Table**: Enables O(n) field lookup by field_id, allowing flexible field ordering
+- **Offset Table**: Enables O(1) field lookup by field_id for dense, 1-based IDs (linear-scan fallback otherwise), while still allowing flexible field ordering
 - **Separate Sections**: Fixed and variable data are separated for efficient access patterns
 - **Packed Structs**: Uses `#[repr(C, packed)]` for compact, predictable layout
 - **bytemuck Integration**: Leverages `Pod` trait for safe zero-copy operations
@@ -148,13 +149,12 @@ fn main() -> Result<()> {
     };
     
     // 2. Serialize
-    let mut serializer = BinarySerializer::new();
-    
     let offset_table_size = 4 * std::mem::size_of::<OffsetEntry>() as u32;
     let data_size = std::mem::size_of::<UserData>() as u32;
     let var_size = 256;
-    
     let header = FormatHeader::new(offset_table_size, data_size, var_size);
+    let mut serializer = BinarySerializer::new();
+    serializer.reserve(header.total_size()); // Pre-allocate for best performance
     serializer.write_header(header);
     
     // Build offset table
@@ -253,6 +253,7 @@ view_mut.modify_blob(20, b"new binary data")?;
 ### BinarySerializer
 
 - `new() -> Self`: Create a new serializer
+- `reserve(capacity: usize)`: Pre-allocate buffer (call with `header.total_size()` before `write_header` for best serialization performance)
 - `write_header(header: FormatHeader)`: Write format header
 - `write_offset_table(entries: &[OffsetEntry])`: Write offset table
 - `write_data(data: &[u8])`: Write fixed-size data section
@@ -262,19 +263,25 @@ view_mut.modify_blob(20, b"new binary data")?;
 
 ### BinaryView
 
-- `view(buffer: &[u8]) -> Result<Self>`: Create view from buffer
-- `find_entry(field_id: u32) -> Option<&OffsetEntry>`: Find offset entry
-- `get_field<T: Pod>(field_id: u32) -> Result<&T>`: Get field reference (zero-copy)
+- `view(buffer: &[u8]) -> Result<Self>`: Create view from buffer, with full validation (magic, version, header size, offset table size, total size vs. buffer length)
+- `view_unchecked(buffer: &[u8]) -> Result<Self>`: Create view while skipping magic/version/header_size/total_size validation — for buffers this process already trusts (e.g. one it just serialized). Still returns `Result` and still checks that `offset_table_size` is a valid multiple of the entry size, so a malformed buffer returns an error rather than panicking; every accessor called on the result still does its own bounds/alignment checks. ~3% faster than `view()` (measured)
+- `find_entry(field_id: u32) -> Option<&OffsetEntry>`: Find offset entry (O(1) for dense, 1-based field IDs; falls back to a linear scan otherwise)
+- `get_field<T: Pod>(field_id: u32) -> Result<&T>`: Get field reference (zero-copy). Returns `UnalignedField` if the field's address isn't aligned for `T` — use `get_field_unaligned` in that case
+- `get_field_unaligned<T: Pod>(field_id: u32) -> Result<T>`: Get a copy of a field's value without requiring alignment (via `ptr::read_unaligned`)
 - `get_string(field_id: u32) -> Result<&str>`: Get string field (zero-copy)
 - `get_blob(field_id: u32) -> Result<&[u8]>`: Get blob field (zero-copy)
 
 ### BinaryViewMut
 
 - `view_mut(buffer: &mut [u8]) -> Result<Self>`: Create mutable view
-- `find_entry(field_id: u32) -> Option<&OffsetEntry>`: Find offset entry
-- `modify_field<T: Pod>(field_id: u32, value: &T) -> Result<()>`: Modify fixed-size field
+- `find_entry(field_id: u32) -> Option<OffsetEntry>`: Find offset entry, by value (O(1) for dense, 1-based field IDs; falls back to a linear scan otherwise)
+- `modify_field<T: Pod>(field_id: u32, value: &T) -> Result<()>`: Modify fixed-size field. Rejects String/Blob-typed fields (`WrongFieldType`) — those must go through `modify_string`/`modify_blob`
 - `modify_string(field_id: u32, value: &str) -> Result<()>`: Modify string field
 - `modify_blob(field_id: u32, value: &[u8]) -> Result<()>`: Modify blob field
+
+### Free functions
+
+- `serialize_to_buffer(header: &FormatHeader, entries: &[OffsetEntry], data: &[u8], var_data: &[u8]) -> Vec<u8>`: Serialize all four sections into one buffer in a single allocation — equivalent to `BinarySerializer` with `write_header`/`write_offset_table`/`write_data`/`write_var_data`, but sized up front
 
 ## Error Handling
 
@@ -286,34 +293,41 @@ The library provides comprehensive error handling via `SerializationError`:
 - `FieldSizeMismatch`: Type/size mismatch
 - `BufferTooSmall`: Buffer insufficient for operation
 - `InvalidOffset`: Offset exceeds buffer bounds
+- `UnalignedField`: Field's address isn't aligned for the requested type — use `get_field_unaligned` instead of `get_field`
+- `InvalidHeaderSize`: Header's `header_size` field doesn't match the expected constant
+- `InvalidOffsetTableSize`: `offset_table_size` isn't a multiple of the offset entry size
+- `InvalidUtf8`: String field's bytes aren't valid UTF-8
+- `WrongFieldType`: Field's declared type doesn't support the requested operation (e.g. calling `modify_field` on a String/Blob field)
 
 ## Performance Characteristics
 
 - **Zero-Copy**: Field access returns references directly into the buffer
-- **O(n) Field Lookup**: Linear search through offset table (n = number of fields)
+- **O(1) Field Lookup**: Direct-index fast path for dense, 1-based field IDs (falls back to a linear scan for sparse/non-sequential IDs — see [Limitations](#limitations-and-known-issues))
 - **In-Place Updates**: No re-serialization needed for modifications
 - **Memory Efficient**: Packed structs minimize overhead
 - **Bounds Checking**: All operations validate bounds for safety
 
 ### Performance Considerations
 
-- Field lookup is linear in the number of fields. For many fields, consider:
-  - Sorting offset table by field_id and using binary search
-  - Using a hash map for field_id → OffsetEntry mapping
+- Field lookup is O(1) when field IDs are dense and 1-based (field N at table index N-1, matching the layout `BinarySerializer` naturally produces if you assign IDs sequentially from 1); it falls back to a linear scan for sparse or non-sequential IDs, so correctness never depends on ID layout, only speed does.
+- Call `serializer.reserve(header.total_size())` before `write_header` — avoiding `Vec` reallocation across the four `write_*` calls measured ~49% faster for the same struct used throughout this README.
+- Use `BinaryView::view_unchecked()` instead of `view()` when the buffer is already trusted (e.g. one this process just serialized) — skips redundant validation, measured ~3% faster.
 - String modification requires the new value to fit in existing space
 - Blob modification similarly constrained by pre-allocated size
 
+See [BENCHMARKS.md](BENCHMARKS.md#implementation-optimizations-before--after) for the measured before/after numbers behind these recommendations.
+
 ## Limitations and Known Issues
 
-1. **Alignment**: For unaligned types (e.g., `f64` in packed structs), direct pointer dereference may cause alignment issues. The current implementation uses unsafe pointer access which may require copying for proper alignment.
+1. **Alignment**: For unaligned types (e.g., `f64` following odd-sized fields in a packed struct), `get_field` checks alignment and returns `UnalignedField` rather than risk creating an invalid reference — use `get_field_unaligned` for fields that aren't guaranteed to be aligned. Whether a given field is actually aligned depends on where the allocator places the buffer, not just the field's offset within it, so the same layout can be aligned on one allocation and not on another.
 
 2. **Checksum**: The checksum field in the header is currently unused (always 0). Future versions may implement integrity checking.
 
-3. **Field Lookup**: Linear search through offset table. For large numbers of fields, consider optimizing the lookup strategy.
+3. **Field Lookup**: O(1) for dense, 1-based field IDs (direct index); falls back to a linear scan for sparse or non-sequential IDs.
 
 4. **String/Blob Size**: Variable-length fields cannot grow beyond their pre-allocated size during modification.
 
-5. **UTF-8 Validation**: String errors currently map to `FieldSizeMismatch` with zeros, which could be improved.
+5. **UTF-8 Validation**: Invalid UTF-8 in a string field returns a dedicated `InvalidUtf8` error.
 
 ## Dependencies
 
@@ -384,10 +398,10 @@ cargo bench --bench varying_sizes_bench
 
 2. **`varying_sizes_bench`**: Performance with varying data sizes (1, 10, 100, 1000 structs).
 
-**Expected Results:**
-- biSere demonstrates superior performance in deserialization operations (zero-copy) and field access
-- biSere demonstrates superior performance in in-place modification operations (no re-serialization required)
-- biSere may exhibit slower performance during initial serialization due to offset table setup overhead
+**Results** (see [BENCHMARKS.md](BENCHMARKS.md) for the full numbers and methodology):
+- biSere is fastest at zero-copy field access (reading a field without deserializing the whole struct) and in-place modification (updating a field without a deserialize/serialize round trip) — the two operations its format is built for.
+- biSere is *not* the fastest at serialize, general-API deserialize (`BinaryView::view()`), or round-trip; bincode is faster at all three for this struct. Its offset table and header are overhead that only pays off across the reads/modifications that follow one serialize.
+- biSere is slower than bincode/postcard for batch-serializing many structs, and produces a larger buffer than postcard/messagepack/bincode for this struct (fixed header + offset table cost).
 
 See `benches/README.md` for detailed benchmark documentation and `BENCHMARKS.md` for comprehensive benchmark results and analysis.
 
@@ -399,11 +413,11 @@ MIT
 ## Future Improvements
 
 - [ ] Implement checksum computation and validation
-- [ ] Optimize field lookup (binary search or hash map)
-- [ ] Add alignment-safe field access
-- [ ] Add builder API for easier serialization
+- [x] Optimize field lookup (direct-index fast path for dense, 1-based IDs; measured -40% on field access, see [BENCHMARKS.md](BENCHMARKS.md#implementation-optimizations-before--after))
+- [x] Add alignment-safe field access (`get_field` checks alignment, `get_field_unaligned` as the copy-based fallback)
+- [ ] Add builder API for easier serialization (`reserve()` exists as a partial step; a real builder is still open)
 - [ ] Support for nested structures
-- [ ] Improved error messages for UTF-8 validation failures
+- [x] Improved error messages for UTF-8 validation failures (`InvalidUtf8` error)
 - [ ] Dynamic string/blob resizing
 - [ ] Field iteration API
 - [ ] Serialization from structs (derive macro)

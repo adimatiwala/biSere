@@ -1,7 +1,9 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use bisere::*;
+use bisere::format::{FormatHeader, OffsetEntry, HEADER_SIZE};
 use bytemuck::{Pod, Zeroable};
 use serde::{Serialize, Deserialize};
+use std::ptr;
 
 // Test data structure for biSere
 #[repr(C, packed)]
@@ -22,36 +24,64 @@ struct UserDataSerde {
     active: u8,
 }
 
-// Helper to serialize with biSere
+// Const header/table for UserData layout → one alloc + 4 copies, no per-call setup
+const BISERE_HEADER: FormatHeader = FormatHeader {
+    magic: bisere::format::MAGIC,
+    version: bisere::format::VERSION,
+    header_size: HEADER_SIZE as u32,
+    offset_table_size: 4 * std::mem::size_of::<OffsetEntry>() as u32,
+    data_size: std::mem::size_of::<UserData>() as u32,
+    var_size: 0,
+    checksum: 0,
+    reserved: [0; 6],
+};
+const BISERE_ENTRIES: [OffsetEntry; 4] = [
+    OffsetEntry { field_id: 1, offset: 0, field_type: FieldType::Uint64 as u16, size: 8 },
+    OffsetEntry { field_id: 2, offset: 8, field_type: FieldType::Uint32 as u16, size: 4 },
+    OffsetEntry { field_id: 3, offset: 12, field_type: FieldType::Float64 as u16, size: 8 },
+    OffsetEntry { field_id: 4, offset: 20, field_type: FieldType::Uint8 as u16, size: 1 },
+];
+
 fn bisere_serialize(data: &UserData) -> Vec<u8> {
-    let mut serializer = BinarySerializer::new();
-    let offset_table_size = 4 * std::mem::size_of::<OffsetEntry>() as u32;
-    let data_size = std::mem::size_of::<UserData>() as u32;
-    let var_size = 0;
-    
-    let header = FormatHeader::new(offset_table_size, data_size, var_size);
-    serializer.write_header(header);
-    
-    let mut offset = 0u32;
-    let entries = vec![
-        OffsetEntry { field_id: 1, offset, field_type: FieldType::Uint64 as u16, size: 8 },
-        OffsetEntry { field_id: 2, offset: { offset += 8; offset }, field_type: FieldType::Uint32 as u16, size: 4 },
-        OffsetEntry { field_id: 3, offset: { offset += 4; offset }, field_type: FieldType::Float64 as u16, size: 8 },
-        OffsetEntry { field_id: 4, offset: { offset += 8; offset }, field_type: FieldType::Uint8 as u16, size: 1 },
-    ];
-    serializer.write_offset_table(&entries);
-    serializer.write_data(bytemuck::bytes_of(data));
-    serializer.write_var_data(&[]);
-    serializer.into_buffer()
+    bisere::serialize_to_buffer(&BISERE_HEADER, &BISERE_ENTRIES, bytemuck::bytes_of(data), &[])
 }
 
+// Deserialize through the real BinaryView API — this is what "deserialize a
+// buffer" means for a caller who doesn't already have a view: validate,
+// then look up and read each field. Uses get_field_unaligned throughout:
+// whether a field's real address is aligned for its type depends on where
+// the allocator places the buffer, not just its file offset (see the
+// get_field vs get_field_unaligned distinction in the docs), so this is
+// the portable choice rather than risking a panic on some allocator.
 fn bisere_deserialize(buffer: &[u8]) -> (u64, u32, f64, u8) {
     let view = BinaryView::view(buffer).unwrap();
-    let id = *view.get_field::<u64>(1).unwrap();
-    let age = *view.get_field::<u32>(2).unwrap();
-    let score = *view.get_field::<f64>(3).unwrap();
-    let active = *view.get_field::<u8>(4).unwrap();
-    (id, age, score, active)
+    (
+        view.get_field_unaligned(1).unwrap(),
+        view.get_field_unaligned(2).unwrap(),
+        view.get_field_unaligned(3).unwrap(),
+        view.get_field_unaligned(4).unwrap(),
+    )
+}
+
+// Layout-specific fast path: for a buffer whose exact layout is known ahead
+// of time (fixed 4-entry offset table, data section at a compile-time-known
+// offset), skip BinaryView and the offset table entirely and read the four
+// fields directly. A legitimate technique for a known-fixed-format hot
+// path — but it is not representative of "biSere's deserialize
+// performance" in general, since it bypasses validation and field lookup;
+// see `bisere` (above) for the number that actually reflects the public
+// API a caller who doesn't already know the layout would use.
+fn bisere_deserialize_layout_specific(buffer: &[u8]) -> (u64, u32, f64, u8) {
+    const DATA_OFF: usize = HEADER_SIZE + 4 * std::mem::size_of::<OffsetEntry>();
+    unsafe {
+        let p = buffer.as_ptr().add(DATA_OFF);
+        (
+            ptr::read_unaligned(p as *const u64),
+            ptr::read_unaligned(p.add(8) as *const u32),
+            ptr::read_unaligned(p.add(12) as *const f64),
+            ptr::read_unaligned(p.add(20) as *const u8),
+        )
+    }
 }
 
 fn bincode_serialize(data: &UserDataSerde) -> Vec<u8> {
@@ -140,7 +170,13 @@ fn criterion_benchmark(c: &mut Criterion) {
     group.bench_function("bisere", |b| {
         b.iter(|| bisere_deserialize(black_box(&bisere_buf)))
     });
-    
+
+    // Not a general "biSere deserialize" number — see the function doc.
+    // Kept separate and clearly labeled rather than folded into "bisere".
+    group.bench_function("bisere_layout_specific", |b| {
+        b.iter(|| bisere_deserialize_layout_specific(black_box(&bisere_buf)))
+    });
+
     group.bench_function("bincode", |b| {
         b.iter(|| bincode_deserialize(black_box(&bincode_buf)))
     });
@@ -203,7 +239,7 @@ fn criterion_benchmark(c: &mut Criterion) {
         b.iter(|| {
             black_box(*view.get_field::<u64>(1).unwrap());
             black_box(*view.get_field::<u32>(2).unwrap());
-            black_box(*view.get_field::<f64>(3).unwrap());
+            black_box(view.get_field_unaligned::<f64>(3).unwrap());
         })
     });
     
@@ -256,6 +292,120 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
     
+    group.finish();
+
+    // BinarySerializer::reserve — same write_header/write_offset_table/
+    // write_data/write_var_data sequence, with vs without a leading
+    // reserve() call sized to the total buffer.
+    let mut group = c.benchmark_group("serializer_reserve");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("bisere_without_reserve", |b| {
+        b.iter(|| {
+            let mut serializer = BinarySerializer::new();
+            serializer.write_header(black_box(BISERE_HEADER));
+            serializer.write_offset_table(&BISERE_ENTRIES);
+            serializer.write_data(bytemuck::bytes_of(&test_data));
+            serializer.write_var_data(&[]);
+            black_box(serializer.into_buffer())
+        })
+    });
+
+    group.bench_function("bisere_with_reserve", |b| {
+        b.iter(|| {
+            let mut serializer = BinarySerializer::new();
+            serializer.reserve(BISERE_HEADER.total_size());
+            serializer.write_header(black_box(BISERE_HEADER));
+            serializer.write_offset_table(&BISERE_ENTRIES);
+            serializer.write_data(bytemuck::bytes_of(&test_data));
+            serializer.write_var_data(&[]);
+            black_box(serializer.into_buffer())
+        })
+    });
+
+    group.finish();
+
+    // BinaryView construction — full validation (view) vs skipping
+    // magic/version/header_size/total_size checks (view_unchecked), on a
+    // buffer already known to be well-formed.
+    let mut group = c.benchmark_group("view_construction");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("bisere_view", |b| {
+        b.iter(|| {
+            black_box(BinaryView::view(black_box(&bisere_buf)).unwrap())
+        })
+    });
+
+    group.bench_function("bisere_view_unchecked", |b| {
+        b.iter(|| {
+            black_box(BinaryView::view_unchecked(black_box(&bisere_buf)).unwrap())
+        })
+    });
+
+    group.finish();
+
+    // Variable-length in-place modification: modify_string / modify_blob
+    // write the new value then zero only the trailing remainder, instead
+    // of zeroing the whole field then overwriting its front — this
+    // benchmark uses a near-full-length replacement value each time,
+    // which is the case that shows the largest difference (every byte in
+    // the field's span was being written twice before).
+    const VAR_FIELD_SIZE: usize = 64;
+    let near_full_string = "x".repeat(VAR_FIELD_SIZE - 1); // leaves room for the NUL
+    let near_full_blob = vec![0xABu8; VAR_FIELD_SIZE - 4];
+
+    let mut string_serializer = BinarySerializer::new();
+    let string_header = FormatHeader::new(
+        std::mem::size_of::<OffsetEntry>() as u32,
+        0,
+        VAR_FIELD_SIZE as u32,
+    );
+    string_serializer.write_header(string_header);
+    string_serializer.write_offset_table(&[OffsetEntry {
+        field_id: 1,
+        offset: 0,
+        field_type: FieldType::String as u16,
+        size: VAR_FIELD_SIZE as u16,
+    }]);
+    string_serializer.write_data(&[]);
+    string_serializer.write_var_data(&vec![0u8; VAR_FIELD_SIZE]);
+    let mut string_buf = string_serializer.into_buffer();
+
+    let mut blob_serializer = BinarySerializer::new();
+    let blob_header = FormatHeader::new(
+        std::mem::size_of::<OffsetEntry>() as u32,
+        0,
+        VAR_FIELD_SIZE as u32,
+    );
+    blob_serializer.write_header(blob_header);
+    blob_serializer.write_offset_table(&[OffsetEntry {
+        field_id: 1,
+        offset: 0,
+        field_type: FieldType::Blob as u16,
+        size: VAR_FIELD_SIZE as u16,
+    }]);
+    blob_serializer.write_data(&[]);
+    blob_serializer.write_var_data(&vec![0u8; VAR_FIELD_SIZE]);
+    let mut blob_buf = blob_serializer.into_buffer();
+
+    let mut group = c.benchmark_group("modify_variable_length");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("bisere_modify_string", |b| {
+        b.iter(|| {
+            let mut view = BinaryViewMut::view_mut(black_box(&mut string_buf)).unwrap();
+            view.modify_string(1, &near_full_string).unwrap();
+        })
+    });
+
+    group.bench_function("bisere_modify_blob", |b| {
+        b.iter(|| {
+            let mut view = BinaryViewMut::view_mut(black_box(&mut blob_buf)).unwrap();
+            view.modify_blob(1, &near_full_blob).unwrap();
+        })
+    });
+
     group.finish();
 
     // Buffer size comparison

@@ -95,10 +95,13 @@ fn main() -> Result<()> {
     
     let id: &u64 = view.get_field(1)?;
     let age: &u32 = view.get_field(2)?;
-    let score: &f64 = view.get_field(3)?;
+    // score (f64) lands at an address unaligned for f64 in this layout;
+    // get_field would return UnalignedField, so get_field_unaligned (a
+    // copy via ptr::read_unaligned) is the correct accessor here.
+    let score: f64 = view.get_field_unaligned(3)?;
     let active: &u8 = view.get_field(4)?;
-    
-    println!("\nDeserialized (zero-copy) - ID: {}, Age: {}, Score: {}, Active: {}", 
+
+    println!("\nDeserialized (zero-copy) - ID: {}, Age: {}, Score: {}, Active: {}",
              id, age, score, *active != 0);
     
     // 4. In-place modification
